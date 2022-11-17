@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.17;
-import "openzeppelin-contracts/access/Ownable.sol";
-import "openzeppelin-contracts/utils/cryptography/MerkleProof.sol";
-import "openzeppelin-contracts/utils/Strings.sol";
-import "openzeppelin-contracts/token/ERC1155/ERC1155.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+import "@openzeppelin/contracts/utils/Strings.sol";
+import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 
 contract Maya is ERC1155, Ownable {
     uint256 public numTokens = 0;
@@ -12,14 +12,33 @@ contract Maya is ERC1155, Ownable {
     address public crossmintAddress =
         0xdAb1a1854214684acE522439684a145E62505233;
 
-    mapping(uint256 => Token) public tokens;
-
     event Crossmint(
         address indexed to,
         uint256 indexed tokenId,
         uint256 amount
     );
     event Mint(address indexed to, uint256 indexed tokenId, uint256 amount);
+    event Lend(
+        address indexed lender,
+        uint256 indexed tokenId,
+        uint256 duration,
+        uint256 timestamp,
+        bytes32 listingId
+    );
+    event Rent(
+        address indexed renter,
+        address indexed lender,
+        uint256 indexed tokenId,
+        uint256 duration,
+        uint256 timestamp,
+        bytes32 listingId
+    );
+    event Removed(
+        address indexed lender,
+        address indexed renter,
+        uint256 indexed tokenId,
+        bytes32 listingId
+    );
 
     struct Token {
         uint256 publicPrice;
@@ -31,6 +50,27 @@ contract Maya is ERC1155, Ownable {
         string uri;
         bytes32 merkleRoot;
     }
+
+    struct Lending {
+        address payable lender;
+        uint256 duration;
+        uint256 tokenId;
+        uint256 price;
+        uint256 timestamp;
+    }
+
+    struct Renting {
+        address renter;
+    }
+
+    struct LendingRenting {
+        Lending lending;
+        Renting renting;
+    }
+
+    mapping(uint256 => Token) public tokens;
+    mapping(bytes32 => LendingRenting) public listings;
+    mapping(address => mapping(uint256 => uint256)) public lendingBalances;
 
     constructor() ERC1155("") {}
 
@@ -44,6 +84,121 @@ contract Maya is ERC1155, Ownable {
 
     function setCrossmintAddress(address _crossmintAddress) public onlyOwner {
         crossmintAddress = _crossmintAddress;
+    }
+
+    function lend(
+        uint256 tokenId,
+        uint256 duration,
+        uint256 price
+    ) public {
+        bytes32 listingId = keccak256(
+            abi.encodePacked(msg.sender, tokenId, duration, block.timestamp)
+        );
+        require(
+            block.timestamp >=
+                block.timestamp + listings[listingId].lending.duration,
+            "Maya: Lending period has not ended"
+        );
+        require(
+            listings[listingId].lending.tokenId == tokenId,
+            "Maya: Token ID does not match"
+        );
+        require(
+            listings[listingId].lending.lender == address(0),
+            "Maya: Lending period has not started"
+        );
+        require(
+            lendingBalances[msg.sender][tokenId] <
+                balanceOf(msg.sender, tokenId),
+            "Maya: Cant lend more than you own"
+        );
+
+        listings[listingId].lending.lender = payable(msg.sender);
+        listings[listingId].lending.duration = duration;
+        listings[listingId].lending.price = price;
+        listings[listingId].lending.timestamp = block.timestamp;
+
+        lendingBalances[msg.sender][tokenId] += 1;
+
+        emit Lend(msg.sender, tokenId, duration, block.timestamp, listingId);
+    }
+
+    function rent(bytes32 listingId) public payable {
+        require(
+            listings[listingId].lending.lender != address(0),
+            "Maya: Invalid listing ID"
+        );
+        require(
+            listings[listingId].lending.price == msg.value,
+            "Maya: Price does not match"
+        );
+        require(
+            listings[listingId].renting.renter == address(0),
+            "Maya: Token is already rented"
+        );
+
+        listings[listingId].renting.renter = payable(msg.sender);
+        listings[listingId].lending.lender.transfer(msg.value);
+
+        emit Rent(
+            msg.sender,
+            listings[listingId].lending.lender,
+            listings[listingId].lending.tokenId,
+            listings[listingId].lending.duration,
+            listings[listingId].lending.timestamp,
+            listingId
+        );
+    }
+
+    function removeListing(bytes32 listingId) public {
+        require(
+            listings[listingId].lending.lender == msg.sender,
+            "Maya: Only lender can remove listing"
+        );
+        require(
+            listings[listingId].renting.renter == address(0) ||
+                block.timestamp >=
+                listings[listingId].lending.timestamp +
+                    listings[listingId].lending.duration,
+            "Maya: Renting period has not ended"
+        );
+
+        if (
+            lendingBalances[msg.sender][listings[listingId].lending.tokenId] > 0
+        ) {
+            lendingBalances[msg.sender][
+                listings[listingId].lending.tokenId
+            ] -= 1;
+        }
+
+        delete listings[listingId];
+
+        emit Removed(
+            msg.sender,
+            listings[listingId].renting.renter,
+            listings[listingId].lending.tokenId,
+            listingId
+        );
+    }
+
+    function getListingById(bytes32 listingId)
+        public
+        view
+        returns (LendingRenting memory)
+    {
+        return listings[listingId];
+    }
+
+    function getListing(
+        address lender,
+        uint256 tokenId,
+        uint256 duration,
+        uint256 timestamp
+    ) public view returns (LendingRenting memory) {
+        bytes32 listingId = keccak256(
+            abi.encodePacked(lender, tokenId, duration, timestamp)
+        );
+        return listings[listingId];
     }
 
     function mint(
@@ -213,5 +368,33 @@ contract Maya is ERC1155, Ownable {
 
     function uri(uint256 tokenId) public view override returns (string memory) {
         return tokens[tokenId].uri;
+    }
+
+    function _beforeTokenTransfer(
+        address operator,
+        address from,
+        address to,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
+    ) internal override(ERC1155) {
+        super._beforeTokenTransfer(operator, from, to, ids, amounts, data);
+
+        if (from != address(0)) {
+            for (uint256 i = 0; i < ids.length; i++) {
+                uint256 tokenId = ids[i];
+                uint256 amount = amounts[i];
+                uint256 fromBalance = balanceOf(from, tokenId);
+                uint256 lendingBalance = lendingBalances[from][tokenId];
+                require(
+                    fromBalance >= lendingBalance,
+                    "cannot transfer lending token"
+                );
+                require(
+                    fromBalance - lendingBalance >= amount,
+                    "cannot transfer lending token"
+                );
+            }
+        }
     }
 }
